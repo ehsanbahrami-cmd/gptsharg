@@ -1,11 +1,11 @@
 
-name: Build Android APK from uploaded ZIP
+name: Build DischargePlan APK
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'DischargePlan_Source.zip'
+      - '**.zip'
       - '.github/workflows/build-apk.yml'
 
 permissions:
@@ -25,23 +25,110 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle 8.7
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
-      - name: Extract Android project ZIP
+      - name: Find and extract Android project
+        shell: bash
         run: |
-          test -f DischargePlan_Source.zip
-          mkdir -p project-src
-          unzip -q DischargePlan_Source.zip -d project-src
-          test -f project-src/settings.gradle.kts
-          test -f project-src/app/build.gradle.kts
+          python3 <<'PY'
+          import zipfile
+          import io
+          import os
+          from pathlib import Path, PurePosixPath
 
-      - name: Build debug APK
-        run: gradle --no-daemon -p project-src assembleDebug
+          destination = Path("project-src")
+          found = False
 
-      - name: Upload APK artifact
+          def inspect(data, label, depth=0):
+              global found
+
+              if depth > 3 or found:
+                  return
+
+              try:
+                  z = zipfile.ZipFile(io.BytesIO(data))
+              except Exception:
+                  return
+
+              names = set(z.namelist())
+
+              for name in names:
+                  if name.endswith("settings.gradle.kts"):
+                      root = str(PurePosixPath(name).parent)
+                      if root == ".":
+                          root = ""
+
+                      prefix = root + "/" if root else ""
+
+                      if prefix + "app/build.gradle.kts" in names:
+                          destination.mkdir(exist_ok=True)
+
+                          for item in z.infolist():
+                              if item.is_dir():
+                                  continue
+
+                              if not item.filename.startswith(prefix):
+                                  continue
+
+                              relative = item.filename[len(prefix):]
+                              if not relative:
+                                  continue
+
+                              target = (destination / relative).resolve()
+                              if destination.resolve() not in target.parents:
+                                  continue
+
+                              target.parent.mkdir(
+                                  parents=True, exist_ok=True
+                              )
+                              target.write_bytes(z.read(item))
+
+                          print("Android project found:", label)
+                          found = True
+                          return
+
+              for item in z.infolist():
+                  if item.filename.lower().endswith(".zip"):
+                      inspect(z.read(item), label + " -> " + item.filename,
+                              depth + 1)
+                      if found:
+                          return
+
+          archives = sorted(
+              Path(".").rglob("*.zip"),
+              key=lambda p: (
+                  p.name != "DischargePlan_Source.zip",
+                  len(str(p))
+              )
+          )
+
+          for archive in archives:
+              if ".git" in archive.parts:
+                  continue
+              inspect(archive.read_bytes(), str(archive))
+              if found:
+                  break
+
+          if not found:
+              raise SystemExit(
+                  "ERROR: No Android project ZIP was found."
+              )
+
+          if not (destination / "settings.gradle.kts").exists():
+              raise SystemExit("Missing settings.gradle.kts")
+
+          if not (destination / "app/build.gradle.kts").exists():
+              raise SystemExit("Missing app/build.gradle.kts")
+          PY
+
+      - name: Build Debug APK
+        run: |
+          gradle --no-daemon -p project-src assembleDebug
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: DischargePlan-debug-apk
